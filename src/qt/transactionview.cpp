@@ -336,6 +336,10 @@ void TransactionView::changedAmount(const QString &amount)
 
 void TransactionView::exportClicked()
 {
+    if (!model || !model->getOptionsModel()) {
+        return;
+    }
+
     // CSV is currently the only supported format
     QString filename = GUIUtil::getSaveFileName(this,
         tr("Export Transaction History"), QString(),
@@ -379,7 +383,7 @@ void TransactionView::contextualMenu(const QPoint &point)
     uint256 hash;
     hash.SetHex(selection.at(0).data(TransactionTableModel::TxHashRole).toString().toStdString());
     abandonAction->setEnabled(model->transactionCanBeAbandoned(hash));
-    bumpFeeAction->setEnabled(model->transactionSignalsRBF(hash));
+    bumpFeeAction->setEnabled(model->transactionCanBeBumped(hash));
 
     if(index.isValid())
     {

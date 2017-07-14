@@ -34,7 +34,6 @@
 #include <QSet>
 #include <QTimer>
 
-#include <boost/foreach.hpp>
 
 WalletModel::WalletModel(const PlatformStyle *platformStyle, CWallet *_wallet, OptionsModel *_optionsModel, QObject *parent) :
     QObject(parent), wallet(_wallet), optionsModel(_optionsModel), addressTableModel(0),
@@ -207,7 +206,7 @@ WalletModel::SendCoinsReturn WalletModel::prepareTransaction(WalletModelTransact
     int nAddresses = 0;
 
     // Pre-check input data for validity
-    Q_FOREACH(const SendCoinsRecipient &rcp, recipients)
+    for (const SendCoinsRecipient &rcp : recipients)
     {
         if (rcp.fSubtractFeeFromAmount)
             fSubtractFeeFromAmount = true;
@@ -310,7 +309,7 @@ WalletModel::SendCoinsReturn WalletModel::sendCoins(WalletModelTransaction &tran
         LOCK2(cs_main, wallet->cs_wallet);
         CWalletTx *newTx = transaction.getTransaction();
 
-        Q_FOREACH(const SendCoinsRecipient &rcp, transaction.getRecipients())
+        for (const SendCoinsRecipient &rcp : transaction.getRecipients())
         {
             if (rcp.paymentRequest.IsInitialized())
             {
@@ -339,9 +338,9 @@ WalletModel::SendCoinsReturn WalletModel::sendCoins(WalletModelTransaction &tran
         transaction_array.append(&(ssTx[0]), ssTx.size());
     }
 
-    // Add addresses / update labels that we've sent to to the address book,
+    // Add addresses / update labels that we've sent to the address book,
     // and emit coinsSent signal for each recipient
-    Q_FOREACH(const SendCoinsRecipient &rcp, transaction.getRecipients())
+    for (const SendCoinsRecipient &rcp : transaction.getRecipients())
     {
         // Don't touch the address book when we have a payment request
         if (!rcp.paymentRequest.IsInitialized())
@@ -574,7 +573,7 @@ bool WalletModel::getPrivKey(const CKeyID &address, CKey& vchPrivKeyOut) const
 void WalletModel::getOutputs(const std::vector<COutPoint>& vOutpoints, std::vector<COutput>& vOutputs)
 {
     LOCK2(cs_main, wallet->cs_wallet);
-    BOOST_FOREACH(const COutPoint& outpoint, vOutpoints)
+    for (const COutPoint& outpoint : vOutpoints)
     {
         if (!wallet->mapWallet.count(outpoint.hash)) continue;
         int nDepth = wallet->mapWallet[outpoint.hash].GetDepthInMainChain();
@@ -656,11 +655,11 @@ bool WalletModel::abandonTransaction(uint256 hash) const
     return wallet->AbandonTransaction(hash);
 }
 
-bool WalletModel::transactionSignalsRBF(uint256 hash) const
+bool WalletModel::transactionCanBeBumped(uint256 hash) const
 {
     LOCK2(cs_main, wallet->cs_wallet);
     const CWalletTx *wtx = wallet->GetWalletTx(hash);
-    return wtx && SignalsOptInRBF(*wtx);
+    return wtx && SignalsOptInRBF(*wtx) && !wtx->mapValue.count("replaced_by_txid");
 }
 
 bool WalletModel::bumpFee(uint256 hash)

@@ -18,6 +18,7 @@
 #include "policy/fees.h"
 #include "pow.h"
 #include "rpc/blockchain.h"
+#include "rpc/mining.h"
 #include "rpc/server.h"
 #include "txmempool.h"
 #include "util.h"
@@ -26,8 +27,6 @@
 
 #include <memory>
 #include <stdint.h>
-
-#include <boost/assign/list_of.hpp>
 
 #include <univalue.h>
 
@@ -95,18 +94,32 @@ UniValue getnetworkhashps(const JSONRPCRequest& request)
     return GetNetworkHashPS(request.params.size() > 0 ? request.params[0].get_int() : 120, request.params.size() > 1 ? request.params[1].get_int() : -1);
 }
 
+bool processNonce(CBlock* pblock)
+{
+    boost::unique_lock<boost::mutex> lock(csBestBlock);
+    CBlockIndex* tip = chainActive.Tip();
+
+    pblock->CheckProofOfWork(true, true);
+
+    boost::system_time checkblktime = boost::get_system_time() + boost::posix_time::seconds(5);
+    while (chainActive.Tip() == tip && !pblock->ProofAvailable() && pblock->IsSolving()) {
+        cvBlockChange.timed_wait(lock, checkblktime);
+        checkblktime += boost::posix_time::seconds(5);
+        LogPrintf("processNonce: same tip: %s, got proof: %s, is solving: %s\n", chainActive.Tip() == tip ? "true" : "false", pblock->ProofAvailable() ? "true" : "false", pblock->IsSolving() ? "true" : "false");
+    }
+    return pblock->CheckProofOfWork();
+}
+
 UniValue generateBlocks(std::shared_ptr<CReserveScript> coinbaseScript, int nGenerate, uint64_t nMaxTries, bool keepScript)
 {
     static const int nInnerLoopCount = 0x10000;
-    int nHeightStart = 0;
     int nHeightEnd = 0;
     int nHeight = 0;
 
     {   // Don't keep cs_main locked
         LOCK(cs_main);
-        nHeightStart = chainActive.Height();
-        nHeight = nHeightStart;
-        nHeightEnd = nHeightStart+nGenerate;
+        nHeight = chainActive.Height();
+        nHeightEnd = nHeight+nGenerate;
     }
     unsigned int nExtraNonce = 0;
     UniValue blockHashes(UniValue::VARR);
@@ -120,7 +133,8 @@ UniValue generateBlocks(std::shared_ptr<CReserveScript> coinbaseScript, int nGen
             LOCK(cs_main);
             IncrementExtraNonce(pblock, chainActive.Tip(), nExtraNonce);
         }
-        while (nMaxTries > 0 && pblock->nNonce < nInnerLoopCount && !CheckProofOfWork(pblock->GetHash(), pblock->nBits, Params().GetConsensus())) {
+        while (nMaxTries > 0 && pblock->nNonce < nInnerLoopCount && (!processNonce(pblock) || !CheckProofOfWork(pblock->GetHash(), pblock->nBits, Params().GetConsensus()))) {
+            printf("[mining] incrementing nonce (hash=%s, CheckPOW=%s)\n", pblock->GetHash().ToString().c_str(), CheckProofOfWork(pblock->GetHash(), pblock->nBits, Params().GetConsensus()) ? "true" : "false");
             ++pblock->nNonce;
             --nMaxTries;
         }
@@ -143,42 +157,6 @@ UniValue generateBlocks(std::shared_ptr<CReserveScript> coinbaseScript, int nGen
         }
     }
     return blockHashes;
-}
-
-UniValue generate(const JSONRPCRequest& request)
-{
-    if (request.fHelp || request.params.size() < 1 || request.params.size() > 2)
-        throw std::runtime_error(
-            "generate nblocks ( maxtries )\n"
-            "\nMine up to nblocks blocks immediately (before the RPC call returns)\n"
-            "\nArguments:\n"
-            "1. nblocks      (numeric, required) How many blocks are generated immediately.\n"
-            "2. maxtries     (numeric, optional) How many iterations to try (default = 1000000).\n"
-            "\nResult:\n"
-            "[ blockhashes ]     (array) hashes of blocks generated\n"
-            "\nExamples:\n"
-            "\nGenerate 11 blocks\n"
-            + HelpExampleCli("generate", "11")
-        );
-
-    int nGenerate = request.params[0].get_int();
-    uint64_t nMaxTries = 1000000;
-    if (request.params.size() > 1) {
-        nMaxTries = request.params[1].get_int();
-    }
-
-    std::shared_ptr<CReserveScript> coinbaseScript;
-    GetMainSignals().ScriptForMining(coinbaseScript);
-
-    // If the keypool is exhausted, no script is returned at all.  Catch this.
-    if (!coinbaseScript)
-        throw JSONRPCError(RPC_WALLET_KEYPOOL_RAN_OUT, "Error: Keypool ran out, please call keypoolrefill first");
-
-    //throw an error if no script was provided
-    if (coinbaseScript->reserveScript.empty())
-        throw JSONRPCError(RPC_INTERNAL_ERROR, "No coinbase script available (mining requires a wallet)");
-
-    return generateBlocks(coinbaseScript, nGenerate, nMaxTries, true);
 }
 
 UniValue generatetoaddress(const JSONRPCRequest& request)
@@ -257,26 +235,32 @@ UniValue getmininginfo(const JSONRPCRequest& request)
 // NOTE: Unlike wallet RPC (which use BTC values), mining RPCs follow GBT (BIP 22) in using satoshi amounts
 UniValue prioritisetransaction(const JSONRPCRequest& request)
 {
-    if (request.fHelp || request.params.size() != 2)
+    if (request.fHelp || request.params.size() != 3)
         throw std::runtime_error(
-            "prioritisetransaction <txid> <fee delta>\n"
+            "prioritisetransaction <txid> <dummy value> <fee delta>\n"
             "Accepts the transaction into mined blocks at a higher (or lower) priority\n"
             "\nArguments:\n"
             "1. \"txid\"       (string, required) The transaction id.\n"
-            "2. fee_delta      (numeric, required) The fee value (in satoshis) to add (or subtract, if negative).\n"
+            "2. dummy          (numeric, optional) API-Compatibility for previous API. Must be zero or null.\n"
+            "                  DEPRECATED. For forward compatibility use named arguments and omit this parameter.\n"
+            "3. fee_delta      (numeric, required) The fee value (in satoshis) to add (or subtract, if negative).\n"
             "                  The fee is not actually paid, only the algorithm for selecting transactions into a block\n"
             "                  considers the transaction as it would have paid a higher (or lower) fee.\n"
             "\nResult:\n"
             "true              (boolean) Returns true\n"
             "\nExamples:\n"
-            + HelpExampleCli("prioritisetransaction", "\"txid\" 10000")
-            + HelpExampleRpc("prioritisetransaction", "\"txid\", 10000")
+            + HelpExampleCli("prioritisetransaction", "\"txid\" 0.0 10000")
+            + HelpExampleRpc("prioritisetransaction", "\"txid\", 0.0, 10000")
         );
 
     LOCK(cs_main);
 
     uint256 hash = ParseHashStr(request.params[0].get_str(), "txid");
-    CAmount nAmount = request.params[1].get_int64();
+    CAmount nAmount = request.params[2].get_int64();
+
+    if (!(request.params[1].isNull() || request.params[1].get_real() == 0)) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Priority is no longer supported, dummy argument to prioritisetransaction must be 0.");
+    }
 
     mempool.PrioritiseTransaction(hash, nAmount);
     return true;
@@ -303,7 +287,7 @@ static UniValue BIP22ValidationResult(const CValidationState& state)
 }
 
 std::string gbt_vb_name(const Consensus::DeploymentPos pos) {
-    const struct BIP9DeploymentInfo& vbinfo = VersionBitsDeploymentInfo[pos];
+    const struct VBDeploymentInfo& vbinfo = VersionBitsDeploymentInfo[pos];
     std::string s = vbinfo.name;
     if (!vbinfo.gbt_force) {
         s.insert(s.begin(), '!');
@@ -515,7 +499,7 @@ UniValue getblocktemplate(const JSONRPCRequest& request)
         // TODO: Maybe recheck connections/IBD and (if something wrong) send an expires-immediately template to stop miners?
     }
 
-    const struct BIP9DeploymentInfo& segwit_info = VersionBitsDeploymentInfo[Consensus::DEPLOYMENT_SEGWIT];
+    const struct VBDeploymentInfo& segwit_info = VersionBitsDeploymentInfo[Consensus::DEPLOYMENT_SEGWIT];
     // If the caller is indicating segwit support, then allow CreateNewBlock()
     // to select witness transactions, after segwit activates (otherwise
     // don't).
@@ -580,7 +564,7 @@ UniValue getblocktemplate(const JSONRPCRequest& request)
         entry.push_back(Pair("hash", tx.GetWitnessHash().GetHex()));
 
         UniValue deps(UniValue::VARR);
-        BOOST_FOREACH (const CTxIn &in, tx.vin)
+        for (const CTxIn &in : tx.vin)
         {
             if (setTxIndex.count(in.prevout.hash))
                 deps.push_back(setTxIndex[in.prevout.hash]);
@@ -629,7 +613,7 @@ UniValue getblocktemplate(const JSONRPCRequest& request)
                 // FALL THROUGH to get vbavailable set...
             case THRESHOLD_STARTED:
             {
-                const struct BIP9DeploymentInfo& vbinfo = VersionBitsDeploymentInfo[pos];
+                const struct VBDeploymentInfo& vbinfo = VersionBitsDeploymentInfo[pos];
                 vbavailable.push_back(Pair(gbt_vb_name(pos), consensusParams.vDeployments[pos].bit));
                 if (setClientRules.find(vbinfo.name) == setClientRules.end()) {
                     if (!vbinfo.gbt_force) {
@@ -642,7 +626,7 @@ UniValue getblocktemplate(const JSONRPCRequest& request)
             case THRESHOLD_ACTIVE:
             {
                 // Add to rules only
-                const struct BIP9DeploymentInfo& vbinfo = VersionBitsDeploymentInfo[pos];
+                const struct VBDeploymentInfo& vbinfo = VersionBitsDeploymentInfo[pos];
                 aRules.push_back(gbt_vb_name(pos));
                 if (setClientRules.find(vbinfo.name) == setClientRules.end()) {
                     // Not supported by the client; make sure it's safe to proceed
@@ -720,19 +704,16 @@ protected:
 
 UniValue submitblock(const JSONRPCRequest& request)
 {
+    // We allow 2 arguments for compliance with BIP22. Argument 2 is ignored.
     if (request.fHelp || request.params.size() < 1 || request.params.size() > 2) {
         throw std::runtime_error(
-            "submitblock \"hexdata\" ( \"jsonparametersobject\" )\n"
+            "submitblock \"hexdata\"  ( \"dummy\" )\n"
             "\nAttempts to submit new block to network.\n"
-            "The 'jsonparametersobject' parameter is currently ignored.\n"
             "See https://en.bitcoin.it/wiki/BIP_0022 for full specification.\n"
 
             "\nArguments\n"
             "1. \"hexdata\"        (string, required) the hex-encoded block data to submit\n"
-            "2. \"parameters\"     (string, optional) object of optional parameters\n"
-            "    {\n"
-            "      \"workid\" : \"id\"    (string, optional) if the server provided a workid, it MUST be included with submissions\n"
-            "    }\n"
+            "2. \"dummy\"          (optional) dummy value, for compatibility with BIP22. This value is ignored.\n"
             "\nResult:\n"
             "\nExamples:\n"
             + HelpExampleCli("submitblock", "\"mydata\"")
@@ -814,7 +795,7 @@ UniValue estimatefee(const JSONRPCRequest& request)
             + HelpExampleCli("estimatefee", "6")
             );
 
-    RPCTypeCheck(request.params, boost::assign::list_of(UniValue::VNUM));
+    RPCTypeCheck(request.params, {UniValue::VNUM});
 
     int nBlocks = request.params[0].get_int();
     if (nBlocks < 1)
@@ -855,7 +836,7 @@ UniValue estimatesmartfee(const JSONRPCRequest& request)
             + HelpExampleCli("estimatesmartfee", "6")
             );
 
-    RPCTypeCheck(request.params, boost::assign::list_of(UniValue::VNUM));
+    RPCTypeCheck(request.params, {UniValue::VNUM});
 
     int nBlocks = request.params[0].get_int();
     bool conservative = true;
@@ -865,10 +846,10 @@ UniValue estimatesmartfee(const JSONRPCRequest& request)
     }
 
     UniValue result(UniValue::VOBJ);
-    int answerFound;
-    CFeeRate feeRate = ::feeEstimator.estimateSmartFee(nBlocks, &answerFound, ::mempool, conservative);
+    FeeCalculation feeCalc;
+    CFeeRate feeRate = ::feeEstimator.estimateSmartFee(nBlocks, &feeCalc, ::mempool, conservative);
     result.push_back(Pair("feerate", feeRate == CFeeRate(0) ? -1.0 : ValueFromAmount(feeRate.GetFeePerK())));
-    result.push_back(Pair("blocks", answerFound));
+    result.push_back(Pair("blocks", feeCalc.returnedTarget));
     return result;
 }
 
@@ -912,7 +893,7 @@ UniValue estimaterawfee(const JSONRPCRequest& request)
             + HelpExampleCli("estimaterawfee", "6 0.9 1")
             );
 
-    RPCTypeCheck(request.params, boost::assign::list_of(UniValue::VNUM)(UniValue::VNUM)(UniValue::VNUM), true);
+    RPCTypeCheck(request.params, {UniValue::VNUM, UniValue::VNUM, UniValue::VNUM}, true);
     RPCTypeCheckArgument(request.params[0], UniValue::VNUM);
     int nBlocks = request.params[0].get_int();
     double threshold = 0.95;
@@ -959,11 +940,10 @@ static const CRPCCommand commands[] =
   //  --------------------- ------------------------  -----------------------  ----------
     { "mining",             "getnetworkhashps",       &getnetworkhashps,       true,  {"nblocks","height"} },
     { "mining",             "getmininginfo",          &getmininginfo,          true,  {} },
-    { "mining",             "prioritisetransaction",  &prioritisetransaction,  true,  {"txid","fee_delta"} },
+    { "mining",             "prioritisetransaction",  &prioritisetransaction,  true,  {"txid","dummy","fee_delta"} },
     { "mining",             "getblocktemplate",       &getblocktemplate,       true,  {"template_request"} },
-    { "mining",             "submitblock",            &submitblock,            true,  {"hexdata","parameters"} },
+    { "mining",             "submitblock",            &submitblock,            true,  {"hexdata","dummy"} },
 
-    { "generating",         "generate",               &generate,               true,  {"nblocks","maxtries"} },
     { "generating",         "generatetoaddress",      &generatetoaddress,      true,  {"nblocks","address","maxtries"} },
 
     { "util",               "estimatefee",            &estimatefee,            true,  {"nblocks"} },
